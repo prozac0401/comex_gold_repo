@@ -1,8 +1,9 @@
 from pathlib import Path
 import re
 from datetime import datetime
+import csv
 
-import pandas as pd
+import xlrd
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
@@ -21,6 +22,19 @@ def parse_date_from_filename(path: Path):
     return datetime.strptime(s, "%Y%m%d").date()
 
 
+def get_total_from_row(sheet, row_idx):
+    """
+    한 행에서 숫자 셀들만 골라 마지막 숫자 값을 반환.
+    (TOTAL REGISTERED 등의 '최종 재고' 값)
+    """
+    last_val = None
+    for col_idx in range(sheet.ncols):
+        cell = sheet.cell(row_idx, col_idx)
+        if cell.ctype == xlrd.XL_CELL_NUMBER:
+            last_val = cell.value
+    return last_val
+
+
 def extract_totals_from_file(path: Path):
     """
     한 개의 Gold_Stocks_YYYYMMDD.xls 파일에서
@@ -34,41 +48,41 @@ def extract_totals_from_file(path: Path):
 
     print(f"[INFO] Parsing {path.name} ...")
 
-    # CME Gold_Stocks.xls 는 보통 옛날 xls 형식이라 xlrd 엔진 사용
-    df = pd.read_excel(path, engine="xlrd")
+    book = xlrd.open_workbook(path)
+    sheet = book.sheet_by_index(0)
 
-    # 첫 번째 컬럼을 라벨로 사용 (TOTAL REGISTERED 등)
-    first_col = df.columns[0]
-    labels = df[first_col].astype(str).str.upper().str.strip()
+    total_registered = None
+    total_eligible = None
+    total_pledged = None
+    combined_total = None
 
-    def get_total(label_key: str):
-        """
-        label_key 로 시작하는 행을 찾아 그 행의 '마지막 숫자 컬럼'을 반환.
-        (예: TOTAL REGISTERED 행의 맨 오른쪽 숫자 = 당일 최종 재고)
-        """
-        mask = labels.str.startswith(label_key)
-        if not mask.any():
-            print(f"[WARN] No row for {label_key} in {path.name}")
-            return None
+    for row_idx in range(sheet.nrows):
+        first_cell = sheet.cell(row_idx, 0)
+        if first_cell.ctype == xlrd.XL_CELL_EMPTY:
+            continue
 
-        row = df.loc[mask].iloc[0]
+        label = str(first_cell.value).upper().strip()
 
-        # 숫자 컬럼만 골라서 마지막 값 사용
-        numeric_vals = row.select_dtypes(include="number")
-        if len(numeric_vals) > 0:
-            return numeric_vals.iloc[-1]
+        if label.startswith("TOTAL REGISTERED"):
+            total_registered = get_total_from_row(sheet, row_idx)
+        elif label.startswith("TOTAL ELIGIBLE"):
+            total_eligible = get_total_from_row(sheet, row_idx)
+        elif label.startswith("TOTAL PLEDGED"):
+            total_pledged = get_total_from_row(sheet, row_idx)
+        elif label.startswith("COMBINED TOTAL"):
+            combined_total = get_total_from_row(sheet, row_idx)
 
-        # 혹시 숫자 타입 인식이 안 되면, 그냥 마지막 컬럼 사용 (fallback)
-        return row.iloc[-1]
+    if any(v is None for v in [total_registered, total_eligible, total_pledged, combined_total]):
+        print(f"[WARN] Missing some totals in {path.name}: "
+              f"reg={total_registered}, eli={total_eligible}, ple={total_pledged}, comb={combined_total}")
 
-    totals = {
+    return {
         "date": date.isoformat(),
-        "total_registered": get_total("TOTAL REGISTERED"),
-        "total_eligible": get_total("TOTAL ELIGIBLE"),
-        "total_pledged": get_total("TOTAL PLEDGED"),
-        "combined_total": get_total("COMBINED TOTAL"),
+        "total_registered": total_registered,
+        "total_eligible": total_eligible,
+        "total_pledged": total_pledged,
+        "combined_total": combined_total,
     }
-    return totals
 
 
 def main():
@@ -84,19 +98,52 @@ def main():
         print("[INFO] No data rows parsed; nothing to do.")
         return
 
-    df = pd.DataFrame(rows)
+    # 날짜 순 정렬 + 같은 날짜는 마지막 것만 사용
+    rows.sort(key=lambda r: r["date"])
+    dedup = {}
+    for r in rows:
+        dedup[r["date"]] = r
+    dates_sorted = sorted(dedup.keys())
+    final_rows = [dedup[d] for d in dates_sorted]
 
-    # 날짜 순 정렬 + 같은 날짜가 있으면 마지막 것만 사용
-    df = df.sort_values("date")
-    df = df.drop_duplicates(subset=["date"], keep="last")
+    # Δ Registered, Δ Combined 계산
+    prev_reg = None
+    prev_comb = None
+    for r in final_rows:
+        reg = r["total_registered"]
+        comb = r["combined_total"]
 
-    # 전일 대비 변화(Δ Registered, Δ Combined Total) 계산
-    df["delta_registered"] = df["total_registered"].diff()
-    df["delta_combined"] = df["combined_total"].diff()
+        if prev_reg is None or reg is None:
+            r["delta_registered"] = None
+        else:
+            r["delta_registered"] = reg - prev_reg
 
-    # summary.csv 로 저장
-    df.to_csv(OUT_CSV, index=False)
-    print(f"[INFO] Wrote {OUT_CSV.relative_to(BASE_DIR)} with {len(df)} rows")
+        if prev_comb is None or comb is None:
+            r["delta_combined"] = None
+        else:
+            r["delta_combined"] = comb - prev_comb
+
+        prev_reg = reg
+        prev_comb = comb
+
+    # CSV 저장
+    fieldnames = [
+        "date",
+        "total_registered",
+        "total_eligible",
+        "total_pledged",
+        "combined_total",
+        "delta_registered",
+        "delta_combined",
+    ]
+
+    with OUT_CSV.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for r in final_rows:
+            writer.writerow(r)
+
+    print(f"[INFO] Wrote {OUT_CSV.relative_to(BASE_DIR)} with {len(final_rows)} rows")
 
 
 if __name__ == "__main__":
