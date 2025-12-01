@@ -2,6 +2,8 @@ import datetime as dt
 from pathlib import Path
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # CME Gold stocks 엑셀 파일 주소
 GOLD_STOCK_URL = "https://www.cmegroup.com/delivery_reports/Gold_Stocks.xls"
@@ -11,7 +13,38 @@ DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
 
-def download_gold_stocks():
+def make_session() -> requests.Session:
+    """Retry 설정이 들어간 세션 생성."""
+    session = requests.Session()
+
+    retries = Retry(
+        total=3,               # 최대 3번까지 재시도
+        backoff_factor=5,      # 1차 5초, 2차 10초, 3차 15초 대기
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+    # 일반 브라우저처럼 보이도록 헤더 설정
+    session.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/129.0.0.0 Safari/537.36"
+            ),
+            "Referer": "https://www.cmegroup.com/",
+            "Accept": "*/*",
+        }
+    )
+
+    return session
+
+
+def download_gold_stocks() -> int:
     today = dt.date.today()
     date_str = today.strftime("%Y%m%d")
     out_path = DATA_DIR / f"Gold_Stocks_{date_str}.xls"
@@ -23,43 +56,31 @@ def download_gold_stocks():
 
     print(f"[INFO] Downloading Gold_Stocks for {today} ...")
 
-    headers = {
-        # 일반 브라우저처럼 보이게 User-Agent 세팅
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/129.0.0.0 Safari/537.36"
-        ),
-        # 대충 CME 사이트 내에서 온 것처럼 보이게 Referer 추가
-        "Referer": "https://www.cmegroup.com/",
-        "Accept": "*/*",
-    }
+    session = make_session()
 
     try:
-        resp = requests.get(
+        # timeout=(연결, 읽기) → 읽기 타임아웃을 넉넉하게 120초로 설정
+        resp = session.get(
             GOLD_STOCK_URL,
-            headers=headers,
-            timeout=60,
-            allow_redirects=True,
+            timeout=(10, 120),
+            allow_redirects=True,  # 리다이렉트 자동 추적
         )
     except Exception as e:
-        print(f"[ERROR] Request to CME failed: {e}")
-        # GitHub Actions가 실패로 인식하도록 1 리턴
+        print(f"[ERROR] Request to CME failed: {e!r}")
         return 1
 
     if resp.status_code != 200:
         print(
             f"[ERROR] HTTP error from CME: {resp.status_code} {resp.reason}"
         )
-        # 혹시 html 에러 페이지 내용이 온다면 앞부분만 찍어서 디버깅에 도움
-        text_preview = ""
+        # 혹시 HTML 에러 페이지가 온다면 앞부분만 프린트
         try:
             text_preview = resp.text[:500]
         except Exception:
-            pass
+            text_preview = ""
 
         if text_preview:
-            print("[ERROR] Response preview:")
+            print("[ERROR] Response preview (first 500 chars):")
             print(text_preview)
 
         return 1
@@ -72,7 +93,6 @@ def download_gold_stocks():
 
 def main():
     code = download_gold_stocks()
-    # main의 return 값을 프로세스 종료 코드로 사용
     raise SystemExit(code)
 
 
