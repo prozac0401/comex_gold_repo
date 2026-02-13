@@ -1,8 +1,10 @@
 import datetime as dt
+import os
 from pathlib import Path
 
 import requests
 from requests.adapters import HTTPAdapter
+from requests.exceptions import ProxyError
 from urllib3.util.retry import Retry
 
 # CME Gold stocks 엑셀 파일 주소
@@ -12,10 +14,18 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
+# 네트워크 모드:
+# - auto  : 기본(환경 프록시 사용) 시도 후 ProxyError 일 때만 direct 재시도
+# - proxy : 환경 프록시만 사용
+# - direct: 환경 프록시를 무시하고 직접 연결만 사용
+NETWORK_MODE = os.getenv("GOLD_STOCK_NETWORK_MODE", "auto").strip().lower()
+VALID_NETWORK_MODES = {"auto", "proxy", "direct"}
 
-def make_session() -> requests.Session:
+
+def make_session(use_env_proxy: bool = True) -> requests.Session:
     """Retry 설정이 들어간 세션 생성."""
     session = requests.Session()
+    session.trust_env = use_env_proxy
 
     retries = Retry(
         total=3,               # 최대 3번까지 재시도
@@ -44,6 +54,40 @@ def make_session() -> requests.Session:
     return session
 
 
+def fetch_gold_stocks(url: str, timeout=(10, 120)) -> requests.Response:
+    """
+    환경에 따라 프록시/직접 연결 전략을 선택해 다운로드 요청 수행.
+    """
+    if NETWORK_MODE not in VALID_NETWORK_MODES:
+        raise ValueError(
+            f"Invalid GOLD_STOCK_NETWORK_MODE={NETWORK_MODE!r}. "
+            f"Use one of {sorted(VALID_NETWORK_MODES)}"
+        )
+
+    if NETWORK_MODE == "proxy":
+        print("[INFO] Network mode: proxy (use environment proxy only)")
+        session = make_session(use_env_proxy=True)
+        return session.get(url, timeout=timeout, allow_redirects=True)
+
+    if NETWORK_MODE == "direct":
+        print("[INFO] Network mode: direct (ignore environment proxy)")
+        session = make_session(use_env_proxy=False)
+        return session.get(url, timeout=timeout, allow_redirects=True)
+
+    # auto
+    print("[INFO] Network mode: auto (proxy first, then direct on ProxyError)")
+    proxy_session = make_session(use_env_proxy=True)
+
+    try:
+        return proxy_session.get(url, timeout=timeout, allow_redirects=True)
+    except ProxyError as e:
+        print(f"[WARN] Proxy request failed: {e!r}")
+        print("[WARN] Retrying with direct connection (trust_env=False)...")
+
+        direct_session = make_session(use_env_proxy=False)
+        return direct_session.get(url, timeout=timeout, allow_redirects=True)
+
+
 def download_gold_stocks() -> int:
     today = dt.date.today()
     date_str = today.strftime("%Y%m%d")
@@ -56,15 +100,9 @@ def download_gold_stocks() -> int:
 
     print(f"[INFO] Downloading Gold_Stocks for {today} ...")
 
-    session = make_session()
-
     try:
         # timeout=(연결, 읽기) → 읽기 타임아웃을 넉넉하게 120초로 설정
-        resp = session.get(
-            GOLD_STOCK_URL,
-            timeout=(10, 120),
-            allow_redirects=True,  # 리다이렉트 자동 추적
-        )
+        resp = fetch_gold_stocks(GOLD_STOCK_URL, timeout=(10, 120))
     except Exception as e:
         print(f"[ERROR] Request to CME failed: {e!r}")
         return 1
