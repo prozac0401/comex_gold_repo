@@ -20,16 +20,3 @@ GitHub Actions를 통해 **매일 자동으로 수집/아카이브**하고,
    └─ workflows/
       └─ fetch_gold_stocks.yml  # GitHub Actions 워크플로우 설정
 
----
-
-
-## 네트워크 이슈 대응
-
-업데이트가 프록시/네트워크 환경에 따라 실패할 수 있어 `fetch_gold_stocks.py`는 아래 환경변수를 지원합니다.
-
-- `GOLD_STOCK_NETWORK_MODE=auto` (기본): 환경 프록시 경로를 먼저 시도하고, `ProxyError`일 때 direct 연결로 재시도
-- `GOLD_STOCK_NETWORK_MODE=proxy`: 환경 프록시만 사용
-- `GOLD_STOCK_NETWORK_MODE=direct`: 환경 프록시를 무시하고 direct 연결만 사용
-
-운영 환경(GitHub Actions, 사내망 등)에서 어떤 경로가 실제로 동작하는지 모드별로 확인해두면 장애 원인을 빠르게 분리할 수 있습니다.
-
