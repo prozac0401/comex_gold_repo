@@ -1,7 +1,7 @@
-from pathlib import Path
+import csv
 import re
 from datetime import datetime
-import csv
+from pathlib import Path
 
 import xlrd
 
@@ -11,22 +11,25 @@ OUT_CSV = BASE_DIR / "summary.csv"
 
 
 def parse_date_from_filename(path: Path):
-    """
-    파일명에서 YYYYMMDD 부분을 뽑아서 date로 변환.
-    예: Gold_Stocks_20251201.xls → 2025-12-01
-    """
-    m = re.search(r"(\d{8})", path.stem)
-    if not m:
+    """Extract YYYYMMDD from the filename and return a date."""
+    match = re.search(r"(\d{8})", path.stem)
+    if not match:
         return None
-    s = m.group(1)
-    return datetime.strptime(s, "%Y%m%d").date()
+    return datetime.strptime(match.group(1), "%Y%m%d").date()
+
+
+def parse_number(value):
+    if value in (None, ""):
+        return None
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def get_total_from_row(sheet, row_idx):
-    """
-    한 행에서 숫자 셀들만 골라 마지막 숫자 값을 반환.
-    (TOTAL REGISTERED 등의 '최종 재고' 값)
-    """
+    """Return the last numeric cell from a totals row."""
     last_val = None
     for col_idx in range(sheet.ncols):
         cell = sheet.cell(row_idx, col_idx)
@@ -35,12 +38,7 @@ def get_total_from_row(sheet, row_idx):
     return last_val
 
 
-def extract_totals_from_file(path: Path):
-    """
-    한 개의 Gold_Stocks_YYYYMMDD.xls 파일에서
-    TOTAL REGISTERED / ELIGIBLE / PLEDGED / COMBINED TOTAL
-    의 '최종 재고' 숫자만 뽑아오는 함수.
-    """
+def extract_totals_from_xls(path: Path):
     date = parse_date_from_filename(path)
     if date is None:
         print(f"[WARN] Skip file without date in name: {path.name}")
@@ -72,9 +70,20 @@ def extract_totals_from_file(path: Path):
         elif label.startswith("COMBINED TOTAL"):
             combined_total = get_total_from_row(sheet, row_idx)
 
-    if any(v is None for v in [total_registered, total_eligible, total_pledged, combined_total]):
-        print(f"[WARN] Missing some totals in {path.name}: "
-              f"reg={total_registered}, eli={total_eligible}, ple={total_pledged}, comb={combined_total}")
+    if any(
+        value is None
+        for value in [
+            total_registered,
+            total_eligible,
+            total_pledged,
+            combined_total,
+        ]
+    ):
+        print(
+            f"[WARN] Missing some totals in {path.name}: "
+            f"reg={total_registered}, eli={total_eligible}, "
+            f"ple={total_pledged}, comb={combined_total}"
+        )
 
     return {
         "date": date.isoformat(),
@@ -82,51 +91,86 @@ def extract_totals_from_file(path: Path):
         "total_eligible": total_eligible,
         "total_pledged": total_pledged,
         "combined_total": combined_total,
+        "_source_priority": 2,
     }
+
+
+def extract_totals_from_csv(path: Path):
+    date = parse_date_from_filename(path)
+    if date is None:
+        print(f"[WARN] Skip file without date in name: {path.name}")
+        return None
+
+    print(f"[INFO] Parsing {path.name} ...")
+
+    with path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        row = next(reader, None)
+
+    if row is None:
+        print(f"[WARN] Empty fallback snapshot: {path.name}")
+        return None
+
+    return {
+        "date": row.get("date") or date.isoformat(),
+        "total_registered": parse_number(row.get("total_registered")),
+        "total_eligible": parse_number(row.get("total_eligible")),
+        "total_pledged": parse_number(row.get("total_pledged")),
+        "combined_total": parse_number(row.get("combined_total")),
+        "_source_priority": 1,
+    }
+
+
+def extract_totals(path: Path):
+    suffix = path.suffix.lower()
+    if suffix == ".xls":
+        return extract_totals_from_xls(path)
+    if suffix == ".csv":
+        return extract_totals_from_csv(path)
+    return None
 
 
 def main():
     rows = []
 
-    # data/ 폴더의 Gold_Stocks_*.xls 전부 훑기
-    for path in sorted(DATA_DIR.glob("Gold_Stocks_*.xls")):
-        t = extract_totals_from_file(path)
-        if t is not None:
-            rows.append(t)
+    for path in sorted(DATA_DIR.glob("Gold_Stocks_*.*")):
+        totals = extract_totals(path)
+        if totals is not None:
+            rows.append(totals)
 
     if not rows:
         print("[INFO] No data rows parsed; nothing to do.")
         return
 
-    # 날짜 순 정렬 + 같은 날짜는 마지막 것만 사용
-    rows.sort(key=lambda r: r["date"])
-    dedup = {}
-    for r in rows:
-        dedup[r["date"]] = r
-    dates_sorted = sorted(dedup.keys())
-    final_rows = [dedup[d] for d in dates_sorted]
+    rows.sort(key=lambda row: row["date"])
 
-    # Δ Registered, Δ Combined 계산
+    dedup = {}
+    for row in rows:
+        existing = dedup.get(row["date"])
+        if existing is None or row["_source_priority"] >= existing["_source_priority"]:
+            dedup[row["date"]] = row
+
+    final_rows = [dedup[date] for date in sorted(dedup.keys())]
+
     prev_reg = None
     prev_comb = None
-    for r in final_rows:
-        reg = r["total_registered"]
-        comb = r["combined_total"]
+    for row in final_rows:
+        reg = row["total_registered"]
+        comb = row["combined_total"]
 
         if prev_reg is None or reg is None:
-            r["delta_registered"] = None
+            row["delta_registered"] = None
         else:
-            r["delta_registered"] = reg - prev_reg
+            row["delta_registered"] = reg - prev_reg
 
         if prev_comb is None or comb is None:
-            r["delta_combined"] = None
+            row["delta_combined"] = None
         else:
-            r["delta_combined"] = comb - prev_comb
+            row["delta_combined"] = comb - prev_comb
 
         prev_reg = reg
         prev_comb = comb
 
-    # CSV 저장
     fieldnames = [
         "date",
         "total_registered",
@@ -137,11 +181,11 @@ def main():
         "delta_combined",
     ]
 
-    with OUT_CSV.open("w", newline="") as f:
+    with OUT_CSV.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        for r in final_rows:
-            writer.writerow(r)
+        for row in final_rows:
+            writer.writerow({key: row.get(key) for key in fieldnames})
 
     print(f"[INFO] Wrote {OUT_CSV.relative_to(BASE_DIR)} with {len(final_rows)} rows")
 

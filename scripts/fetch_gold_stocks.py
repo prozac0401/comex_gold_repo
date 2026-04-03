@@ -1,35 +1,47 @@
+import csv
 import datetime as dt
-import os
+import re
 from pathlib import Path
 
 import requests
 from requests.adapters import HTTPAdapter
-from requests.exceptions import ProxyError
 from urllib3.util.retry import Retry
 
-# CME Gold stocks 엑셀 파일 주소
+# Primary source from CME. This may return 403 for GitHub-hosted runners.
 GOLD_STOCK_URL = "https://www.cmegroup.com/delivery_reports/Gold_Stocks.xls"
+
+# Public fallback that exposes the latest COMEX gold inventory totals in HTML.
+FALLBACK_GOLD_URL = "https://www.silveroftruth.com/tools/comex-inventory"
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
-# 네트워크 모드:
-# - auto  : 기본(환경 프록시 사용) 시도 후 ProxyError 일 때만 direct 재시도
-# - proxy : 환경 프록시만 사용
-# - direct: 환경 프록시를 무시하고 직접 연결만 사용
-NETWORK_MODE = os.getenv("GOLD_STOCK_NETWORK_MODE", "auto").strip().lower()
-VALID_NETWORK_MODES = {"auto", "proxy", "direct"}
+FALLBACK_FIELDS = [
+    "date",
+    "total_registered",
+    "total_eligible",
+    "total_pledged",
+    "combined_total",
+    "source",
+]
+
+FALLBACK_PATTERN = re.compile(
+    r"Gold(?:<!-- -->)? Inventory.*?"
+    r"Registered</span><span[^>]*>(?P<registered>[\d.]+)M oz</span>.*?"
+    r"Eligible</span><span[^>]*>(?P<eligible>[\d.]+)M oz</span>.*?"
+    r"Total</span><span[^>]*>(?P<total>[\d.]+)M oz</span>",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
-def make_session(use_env_proxy: bool = True) -> requests.Session:
-    """Retry 설정이 들어간 세션 생성."""
+def make_session() -> requests.Session:
+    """Create a retry-enabled HTTP session."""
     session = requests.Session()
-    session.trust_env = use_env_proxy
 
     retries = Retry(
-        total=3,               # 최대 3번까지 재시도
-        backoff_factor=5,      # 1차 5초, 2차 10초, 3차 15초 대기
+        total=3,
+        backoff_factor=5,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"],
         raise_on_status=False,
@@ -38,7 +50,6 @@ def make_session(use_env_proxy: bool = True) -> requests.Session:
     session.mount("https://", adapter)
     session.mount("http://", adapter)
 
-    # 일반 브라우저처럼 보이도록 헤더 설정
     session.headers.update(
         {
             "User-Agent": (
@@ -54,78 +65,111 @@ def make_session(use_env_proxy: bool = True) -> requests.Session:
     return session
 
 
-def fetch_gold_stocks(url: str, timeout=(10, 120)) -> requests.Response:
-    """
-    환경에 따라 프록시/직접 연결 전략을 선택해 다운로드 요청 수행.
-    """
-    if NETWORK_MODE not in VALID_NETWORK_MODES:
-        raise ValueError(
-            f"Invalid GOLD_STOCK_NETWORK_MODE={NETWORK_MODE!r}. "
-            f"Use one of {sorted(VALID_NETWORK_MODES)}"
+def xls_path_for(day: dt.date) -> Path:
+    return DATA_DIR / f"Gold_Stocks_{day:%Y%m%d}.xls"
+
+
+def csv_path_for(day: dt.date) -> Path:
+    return DATA_DIR / f"Gold_Stocks_{day:%Y%m%d}.csv"
+
+
+def print_response_preview(resp: requests.Response) -> None:
+    try:
+        text_preview = resp.text[:500]
+    except Exception:
+        text_preview = ""
+
+    if text_preview:
+        print("[ERROR] Response preview (first 500 chars):")
+        print(text_preview)
+
+
+def parse_million_ounces(value: str) -> float:
+    return float(value) * 1_000_000
+
+
+def fetch_fallback_snapshot(session: requests.Session, day: dt.date) -> dict:
+    print(f"[WARN] Falling back to {FALLBACK_GOLD_URL}")
+
+    resp = session.get(
+        FALLBACK_GOLD_URL,
+        timeout=(10, 120),
+        allow_redirects=True,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"Fallback HTTP error: {resp.status_code} {resp.reason}"
         )
 
-    if NETWORK_MODE == "proxy":
-        print("[INFO] Network mode: proxy (use environment proxy only)")
-        session = make_session(use_env_proxy=True)
-        return session.get(url, timeout=timeout, allow_redirects=True)
+    match = FALLBACK_PATTERN.search(resp.text)
+    if not match:
+        raise RuntimeError("Could not parse fallback gold inventory section")
 
-    if NETWORK_MODE == "direct":
-        print("[INFO] Network mode: direct (ignore environment proxy)")
-        session = make_session(use_env_proxy=False)
-        return session.get(url, timeout=timeout, allow_redirects=True)
+    registered = parse_million_ounces(match.group("registered"))
+    eligible = parse_million_ounces(match.group("eligible"))
+    combined_total = parse_million_ounces(match.group("total"))
 
-    # auto
-    print("[INFO] Network mode: auto (proxy first, then direct on ProxyError)")
-    proxy_session = make_session(use_env_proxy=True)
+    return {
+        "date": day.isoformat(),
+        "total_registered": registered,
+        "total_eligible": eligible,
+        "total_pledged": "",
+        "combined_total": combined_total,
+        "source": FALLBACK_GOLD_URL,
+    }
 
-    try:
-        return proxy_session.get(url, timeout=timeout, allow_redirects=True)
-    except ProxyError as e:
-        print(f"[WARN] Proxy request failed: {e!r}")
-        print("[WARN] Retrying with direct connection (trust_env=False)...")
 
-        direct_session = make_session(use_env_proxy=False)
-        return direct_session.get(url, timeout=timeout, allow_redirects=True)
+def save_fallback_snapshot(path: Path, row: dict) -> None:
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=FALLBACK_FIELDS)
+        writer.writeheader()
+        writer.writerow(row)
 
 
 def download_gold_stocks() -> int:
     today = dt.date.today()
-    date_str = today.strftime("%Y%m%d")
-    out_path = DATA_DIR / f"Gold_Stocks_{date_str}.xls"
+    out_xls_path = xls_path_for(today)
+    out_csv_path = csv_path_for(today)
 
-    # 이미 오늘자 파일이 있으면 스킵
-    if out_path.exists():
-        print(f"[INFO] File already exists for today: {out_path}")
+    if out_xls_path.exists():
+        if out_csv_path.exists():
+            out_csv_path.unlink()
+        print(f"[INFO] File already exists for today: {out_xls_path}")
         return 0
 
     print(f"[INFO] Downloading Gold_Stocks for {today} ...")
 
+    session = make_session()
+
     try:
-        # timeout=(연결, 읽기) → 읽기 타임아웃을 넉넉하게 120초로 설정
-        resp = fetch_gold_stocks(GOLD_STOCK_URL, timeout=(10, 120))
-    except Exception as e:
-        print(f"[ERROR] Request to CME failed: {e!r}")
-        return 1
-
-    if resp.status_code != 200:
-        print(
-            f"[ERROR] HTTP error from CME: {resp.status_code} {resp.reason}"
+        resp = session.get(
+            GOLD_STOCK_URL,
+            timeout=(10, 120),
+            allow_redirects=True,
         )
-        # 혹시 HTML 에러 페이지가 온다면 앞부분만 프린트
-        try:
-            text_preview = resp.text[:500]
-        except Exception:
-            text_preview = ""
+    except Exception as exc:
+        print(f"[ERROR] Request to CME failed: {exc!r}")
+        resp = None
 
-        if text_preview:
-            print("[ERROR] Response preview (first 500 chars):")
-            print(text_preview)
+    if resp is not None and resp.status_code == 200 and resp.content:
+        out_xls_path.write_bytes(resp.content)
+        if out_csv_path.exists():
+            out_csv_path.unlink()
+        print(f"[INFO] Saved official CME file to {out_xls_path}")
+        return 0
 
+    if resp is not None:
+        print(f"[ERROR] HTTP error from CME: {resp.status_code} {resp.reason}")
+        print_response_preview(resp)
+
+    try:
+        snapshot = fetch_fallback_snapshot(session, today)
+    except Exception as exc:
+        print(f"[ERROR] Fallback fetch failed: {exc!r}")
         return 1
 
-    # 정상 응답이면 파일 저장
-    out_path.write_bytes(resp.content)
-    print(f"[INFO] Saved to {out_path}")
+    save_fallback_snapshot(out_csv_path, snapshot)
+    print(f"[INFO] Saved fallback snapshot to {out_csv_path}")
     return 0
 
 
