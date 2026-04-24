@@ -8,6 +8,10 @@ import xlrd
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 OUT_CSV = BASE_DIR / "summary.csv"
+DATE_LABEL_PATTERN = re.compile(
+    r"(?P<label>Activity|Report) Date:\s*(?P<date>\d{1,2}/\d{1,2}/\d{4})",
+    re.IGNORECASE,
+)
 
 
 def parse_date_from_filename(path: Path):
@@ -16,6 +20,28 @@ def parse_date_from_filename(path: Path):
     if not match:
         return None
     return datetime.strptime(match.group(1), "%Y%m%d").date()
+
+
+def parse_date_from_sheet(sheet):
+    """Prefer CME's activity date over the download/report date."""
+    report_date = None
+
+    for row_idx in range(sheet.nrows):
+        for col_idx in range(sheet.ncols):
+            cell = sheet.cell(row_idx, col_idx)
+            if cell.ctype != xlrd.XL_CELL_TEXT:
+                continue
+
+            match = DATE_LABEL_PATTERN.search(str(cell.value))
+            if not match:
+                continue
+
+            parsed = datetime.strptime(match.group("date"), "%m/%d/%Y").date()
+            if match.group("label").lower() == "activity":
+                return parsed
+            report_date = parsed
+
+    return report_date
 
 
 def parse_number(value):
@@ -39,15 +65,14 @@ def get_total_from_row(sheet, row_idx):
 
 
 def extract_totals_from_xls(path: Path):
-    date = parse_date_from_filename(path)
-    if date is None:
-        print(f"[WARN] Skip file without date in name: {path.name}")
-        return None
-
     print(f"[INFO] Parsing {path.name} ...")
 
     book = xlrd.open_workbook(path)
     sheet = book.sheet_by_index(0)
+    date = parse_date_from_sheet(sheet) or parse_date_from_filename(path)
+    if date is None:
+        print(f"[WARN] Skip file without date in workbook or name: {path.name}")
+        return None
 
     total_registered = None
     total_eligible = None
@@ -182,7 +207,11 @@ def main():
     ]
 
     with OUT_CSV.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(
+            f,
+            fieldnames=fieldnames,
+            lineterminator="\n",
+        )
         writer.writeheader()
         for row in final_rows:
             writer.writerow({key: row.get(key) for key in fieldnames})
